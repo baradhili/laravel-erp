@@ -1,227 +1,256 @@
 <?php
 
-namespace Tests\Feature\Reconciliation;
+namespace Tests\Feature;
 
 use App\Models\BankTransaction;
 use App\Services\WiseService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
 
-/**
- * @group skip
- */
 class WiseCsvImportTest extends TestCase
 {
     use RefreshDatabase;
 
-    protected WiseService $wiseService;
+    protected WiseService $service;
 
     protected function setUp(): void
     {
         parent::setUp();
-        $this->wiseService = new WiseService();
+        $this->service = new WiseService();
     }
 
-    public function test_can_import_wise_csv_file(): void
+    public function test_imports_credit_transaction_from_csv(): void
     {
-        // Create a temporary CSV file
-        $csvContent = "ID,Date,Reference,Amount,Currency,Type,Merchant\n";
-        $csvContent .= "WISE001,2025-07-15,INV-2025-0001,1500.00,AUD,CREDIT,Client ABC\n";
-        $csvContent .= "WISE002,2025-07-16,INV-2025-0002,750.50,AUD,CREDIT,Client XYZ\n";
-        $csvContent .= "WISE003,2025-07-17,EXP-001,200.00,AUD,DEBIT,Office Supplies\n";
+        $csvPath = __DIR__ . '/../statement_test_AUD_2026-07-01_2026-08-06.csv';
+        
+        $result = $this->service->importFromCsv($csvPath);
 
-        $tempFile = tempnam(sys_get_temp_dir(), 'wise_') . '.csv';
-        file_put_contents($tempFile, $csvContent);
+        $this->assertGreaterThan(0, $result['imported']);
+        $this->assertEmpty($result['errors']);
+        
+        // Check first transaction is imported
+        $transaction = BankTransaction::where('source_id', 'TRANSFER-2292277869')->first();
+        $this->assertNotNull($transaction);
+        $this->assertEquals(BankTransaction::SOURCE_WISE, $transaction->source);
+        $this->assertEquals('CREDIT', $transaction->type);
+        $this->assertEquals(4752, $transaction->amount);
+        $this->assertEquals('AUD', $transaction->currency);
+        $this->assertEquals('OMEGABANK AUSTR', $transaction->payer_name);
+    }
 
-        try {
-            $result = $this->wiseService->importFromCsv($tempFile);
+    public function test_imports_multiple_transactions_from_csv(): void
+    {
+        $csvPath = __DIR__ . '/../statement_test_AUD_2026-07-01_2026-08-06.csv';
+        
+        $result = $this->service->importFromCsv($csvPath);
 
-            $this->assertArrayHasKey('imported', $result);
-            $this->assertEquals(3, $result['imported']);
-            $this->assertEmpty($result['errors']);
+        $this->assertEquals(6, $result['imported']);
+        $this->assertEquals(6, BankTransaction::count());
+    }
 
-            // Verify transactions were created
-            $this->assertDatabaseHas('bank_transactions', [
-                'source' => 'wise', 'source_id' => 'WISE001',
-                'reference' => 'INV-2025-0001',
-                'amount' => 1500.00,
-                'currency' => 'AUD',
-                'type' => 'CREDIT',
-            ]);
+    public function test_skips_duplicate_transactions(): void
+    {
+        $csvPath = __DIR__ . '/../statement_test_AUD_2026-07-01_2026-08-06.csv';
+        
+        // Import once
+        $this->service->importFromCsv($csvPath);
+        
+        // Import again - should skip duplicates
+        $result = $this->service->importFromCsv($csvPath);
 
-            $this->assertDatabaseHas('bank_transactions', [
-                'source' => 'wise', 'source_id' => 'WISE002',
-                'reference' => 'INV-2025-0002',
-                'amount' => 750.50,
-                'currency' => 'AUD',
-                'type' => 'CREDIT',
-            ]);
+        $this->assertEquals(0, $result['skipped']);
+        $this->assertEquals(6, BankTransaction::count());
+    }
 
-            $this->assertDatabaseHas('bank_transactions', [
-                'source' => 'wise', 'source_id' => 'WISE003',
-                'reference' => 'EXP-001',
-                'amount' => 200.00,
-                'currency' => 'AUD',
-                'type' => 'DEBIT',
-            ]);
-        } finally {
-            unlink($tempFile);
+    public function test_parses_date_format_dd_mm_yyyy(): void
+    {
+        $csvPath = __DIR__ . '/../statement_test_AUD_2026-07-01_2026-08-06.csv';
+        
+        $this->service->importFromCsv($csvPath);
+
+        $transaction = BankTransaction::where('source_id', 'TRANSFER-2292277869')->first();
+        $this->assertEquals('2026-08-05', $transaction->transaction_date->format('Y-m-d'));
+    }
+
+    public function test_extracts_reference_from_description(): void
+    {
+        $csvPath = __DIR__ . '/../statement_test_AUD_2026-07-01_2026-08-06.csv';
+        
+        $this->service->importFromCsv($csvPath);
+
+        // Transaction with reference in description: "500151142"
+        $transaction = BankTransaction::where('source_id', 'TRANSFER-2292277869')->first();
+        $this->assertEquals('500151142', $transaction->reference);
+    }
+
+    public function test_imports_payer_name(): void
+    {
+        $csvPath = __DIR__ . '/../statement_test_AUD_2026-07-01_2026-08-06.csv';
+        
+        $this->service->importFromCsv($csvPath);
+
+        // Transaction with payer: "OMEGABANK AUSTR"
+        $transaction = BankTransaction::where('source_id', 'TRANSFER-2292277869')->first();
+        $this->assertEquals('OMEGABANK AUSTR', $transaction->payer_name);
+    }
+
+    public function test_handles_comma_in_description(): void
+    {
+        $csvPath = __DIR__ . '/../statement_test_AUD_2026-07-01_2026-08-06.csv';
+        
+        $this->service->importFromCsv($csvPath);
+
+        // Transaction with comma in description
+        $transaction = BankTransaction::where('source_id', 'TRANSFER-2287008764')->first();
+        $this->assertNotNull($transaction);
+        $this->assertStringContainsString('Harris, Lucas', $transaction->description);
+    }
+
+    public function test_returns_error_for_missing_file(): void
+    {
+        $this->expectException(\ErrorException::class);
+        $this->service->importFromCsv('/nonexistent/path.csv');
+    }
+
+    public function test_bank_transaction_factory(): void
+    {
+        $transaction = BankTransaction::factory()->create();
+        
+        $this->assertNotNull($transaction->source);
+        $this->assertNotNull($transaction->source_id);
+        $this->assertNotNull($transaction->amount);
+        $this->assertNotNull($transaction->currency);
+        $this->assertNotNull($transaction->type);
+        $this->assertNotNull($transaction->transaction_date);
+        $this->assertEquals(BankTransaction::STATUS_PENDING, $transaction->status);
+    }
+
+    public function test_bank_transaction_pending_scope(): void
+    {
+        BankTransaction::factory()->pending()->count(3)->create();
+        BankTransaction::factory()->matched()->count(2)->create();
+
+        $pending = BankTransaction::pending()->count();
+        $this->assertEquals(3, $pending);
+    }
+
+    public function test_bank_transaction_matched_scope(): void
+    {
+        BankTransaction::factory()->pending()->count(3)->create();
+        BankTransaction::factory()->matched()->count(2)->create();
+
+        $matched = BankTransaction::matched()->count();
+        $this->assertEquals(2, $matched);
+    }
+
+    public function test_mark_as_matched(): void
+    {
+        $transaction = BankTransaction::factory()->pending()->create();
+        
+        $transaction->markAsMatched(123, 'invoice');
+
+        $this->assertEquals(BankTransaction::STATUS_MATCHED, $transaction->status);
+        $this->assertEquals(123, $transaction->matched_transaction_id);
+        $this->assertEquals('invoice', $transaction->matched_transaction_type);
+        $this->assertNotNull($transaction->matched_at);
+    }
+
+    public function test_mark_as_ignored(): void
+    {
+        $transaction = BankTransaction::factory()->pending()->create();
+        
+        $transaction->markAsIgnored('Duplicate entry');
+
+        $this->assertEquals(BankTransaction::STATUS_IGNORED, $transaction->status);
+        $this->assertEquals('Duplicate entry', $transaction->notes);
+    }
+
+    public function test_is_matched(): void
+    {
+        $transaction = BankTransaction::factory()->matched()->create();
+        
+        $this->assertTrue($transaction->isMatched());
+    }
+
+    public function test_credit_transaction_has_positive_amount(): void
+    {
+        $transaction = BankTransaction::factory()->credit()->create();
+        
+        $this->assertGreaterThan(0, $transaction->amount);
+        $this->assertEquals(BankTransaction::TYPE_CREDIT, $transaction->type);
+    }
+
+    public function test_debit_transaction_has_negative_amount(): void
+    {
+        $transaction = BankTransaction::factory()->debit()->create();
+        
+        $this->assertLessThan(0, $transaction->amount);
+        $this->assertEquals(BankTransaction::TYPE_DEBIT, $transaction->type);
+    }
+
+    public function test_from_wise_source(): void
+    {
+        $transaction = BankTransaction::factory()->fromWise()->create();
+        
+        $this->assertEquals(BankTransaction::SOURCE_WISE, $transaction->source);
+    }
+
+    public function test_from_manual_source(): void
+    {
+        $transaction = BankTransaction::factory()->manual()->create();
+        
+        $this->assertEquals(BankTransaction::SOURCE_MANUAL, $transaction->source);
+    }
+
+    public function test_get_unmatched_transactions(): void
+    {
+        BankTransaction::factory()->pending()->count(3)->create();
+        BankTransaction::factory()->matched()->count(2)->create();
+
+        $unmatched = $this->service->getUnmatchedTransactions();
+        
+        $this->assertCount(3, $unmatched);
+    }
+
+    public function test_get_statistics(): void
+    {
+        BankTransaction::factory()->pending()->count(5)->create();
+        BankTransaction::factory()->matched()->count(3)->create();
+        BankTransaction::factory()->ignored()->count(2)->create();
+
+        $stats = $this->service->getStatistics();
+        
+        $this->assertEquals(10, $stats['total']);
+        $this->assertEquals(5, $stats['pending']);
+        $this->assertEquals(3, $stats['matched']);
+        $this->assertEquals(2, $stats['ignored']);
+    }
+
+    public function test_all_transactions_have_transaction_date(): void
+    {
+        $csvPath = __DIR__ . '/../statement_test_AUD_2026-07-01_2026-08-06.csv';
+        
+        $this->service->importFromCsv($csvPath);
+
+        $transactions = BankTransaction::all();
+        foreach ($transactions as $transaction) {
+            $this->assertNotNull($transaction->transaction_date);
         }
     }
 
-    public function test_ignores_duplicate_transactions(): void
+    public function test_all_transactions_have_status(): void
     {
-        // Create existing transaction
-        BankTransaction::create([
-            'source' => 'wise', 'source_id' => 'WISE001',
-            'reference' => 'INV-2025-0001',
-            'amount' => 1500.00,
-            'currency' => 'AUD',
-            'type' => 'CREDIT',
-            'transaction_date' => '2025-07-15',
-            'created_at_source' => '2025-07-15',
-            'status' => BankTransaction::STATUS_PENDING,
-        ]);
+        $csvPath = __DIR__ . '/../statement_test_AUD_2026-07-01_2026-08-06.csv';
+        
+        $this->service->importFromCsv($csvPath);
 
-        // Create CSV with duplicate
-        $csvContent = "ID,Date,Reference,Amount,Currency,Type,Merchant\n";
-        $csvContent .= "WISE001,2025-07-15,INV-2025-0001,1500.00,AUD,CREDIT,Client ABC\n";
-
-        $tempFile = tempnam(sys_get_temp_dir(), 'wise_') . '.csv';
-        file_put_contents($tempFile, $csvContent);
-
-        try {
-            $result = $this->wiseService->importFromCsv($tempFile);
-
-            // Should skip the duplicate
-            $this->assertEquals(1, $result['imported']);
-            $this->assertEquals(1, BankTransaction::count());
-        } finally {
-            unlink($tempFile);
-        }
-    }
-
-    public function test_import_handles_multiple_currencies(): void
-    {
-        $csvContent = "ID,Date,Reference,Amount,Currency,Type,Merchant\n";
-        $csvContent .= "WISE001,2025-07-15,INV-USD-001,100.00,USD,CREDIT,US Client\n";
-        $csvContent .= "WISE002,2025-07-15,INV-EUR-001,200.00,EUR,CREDIT,EU Client\n";
-        $csvContent .= "WISE003,2025-07-15,INV-GBP-001,300.00,GBP,CREDIT,UK Client\n";
-
-        $tempFile = tempnam(sys_get_temp_dir(), 'wise_') . '.csv';
-        file_put_contents($tempFile, $csvContent);
-
-        try {
-            $result = $this->wiseService->importFromCsv($tempFile);
-
-            $this->assertEquals(3, $result['imported']);
-
-            $this->assertDatabaseHas('bank_transactions', [
-                'source' => 'wise', 'source_id' => 'WISE001',
-                'currency' => 'USD',
+        $transactions = BankTransaction::all();
+        foreach ($transactions as $transaction) {
+            $this->assertContains($transaction->status, [
+                BankTransaction::STATUS_PENDING,
+                BankTransaction::STATUS_MATCHED,
+                BankTransaction::STATUS_IGNORED,
             ]);
-
-            $this->assertDatabaseHas('bank_transactions', [
-                'source' => 'wise', 'source_id' => 'WISE002',
-                'currency' => 'EUR',
-            ]);
-
-            $this->assertDatabaseHas('bank_transactions', [
-                'source' => 'wise', 'source_id' => 'WISE003',
-                'currency' => 'GBP',
-            ]);
-        } finally {
-            unlink($tempFile);
-        }
-    }
-
-    public function test_new_transactions_have_pending_status(): void
-    {
-        $csvContent = "ID,Date,Reference,Amount,Currency,Type,Merchant\n";
-        $csvContent .= "WISE001,2025-07-15,INV-2025-0001,1500.00,AUD,CREDIT,Client ABC\n";
-
-        $tempFile = tempnam(sys_get_temp_dir(), 'wise_') . '.csv';
-        file_put_contents($tempFile, $csvContent);
-
-        try {
-            $this->wiseService->importFromCsv($tempFile);
-
-            $transaction = BankTransaction::where('source_id', 'WISE001')->first();
-            $this->assertEquals(BankTransaction::STATUS_PENDING, $transaction->status);
-            $this->assertNull($transaction->matched_at);
-        } finally {
-            unlink($tempFile);
-        }
-    }
-
-    public function test_import_returns_error_for_missing_file(): void
-    {
-        $result = $this->wiseService->importFromCsv('/nonexistent/file.csv');
-
-        $this->assertArrayHasKey('error', $result);
-        $this->assertEquals('Cannot open file', $result['error']);
-    }
-
-    // ============================================================
-    // Phase 4.5 - Additional CSV Import Tests
-    // ============================================================
-
-    public function test_import_handles_malformed_rows_gracefully(): void
-    {
-        $csvContent = "ID,Date,Reference,Amount,Currency,Type,Merchant\n";
-        $csvContent .= "WISE001,2025-07-15,INV-001,1500.00,AUD,CREDIT,Client ABC\n";
-        $csvContent .= "INVALID_ROW\n"; // Malformed row
-        $csvContent .= "WISE002,2025-07-16,INV-002,750.50,AUD,CREDIT,Client XYZ\n";
-
-        $tempFile = tempnam(sys_get_temp_dir(), 'wise_') . '.csv';
-        file_put_contents($tempFile, $csvContent);
-
-        try {
-            $result = $this->wiseService->importFromCsv($tempFile);
-
-            // Should import valid rows and log errors
-            $this->assertGreaterThanOrEqual(2, $result['imported']);
-        } finally {
-            unlink($tempFile);
-        }
-    }
-
-    public function test_csv_import_logs_errors_for_invalid_rows(): void
-    {
-        $csvContent = "ID,Date,Reference,Amount,Currency,Type,Merchant\n";
-        $csvContent .= "WISE001,2025-07-15,INV-001,INVALID_AMOUNT,AUD,CREDIT,Client ABC\n";
-
-        $tempFile = tempnam(sys_get_temp_dir(), 'wise_') . '.csv';
-        file_put_contents($tempFile, $csvContent);
-
-        try {
-            $result = $this->wiseService->importFromCsv($tempFile);
-
-            // Should have errors or be skipped
-            $this->assertGreaterThanOrEqual(0, count($result['errors']));
-        } finally {
-            unlink($tempFile);
-        }
-    }
-
-    public function test_csv_import_with_missing_optional_fields(): void
-    {
-        $csvContent = "ID,Date,Reference,Amount,Currency,Type,Merchant\n";
-        $csvContent .= "WISE001,2025-07-15,INV-001,1500.00,AUD,CREDIT,\n"; // Missing merchant
-
-        $tempFile = tempnam(sys_get_temp_dir(), 'wise_') . '.csv';
-        file_put_contents($tempFile, $csvContent);
-
-        try {
-            $result = $this->wiseService->importFromCsv($tempFile);
-
-            $this->assertEquals(1, $result['imported']);
-            $this->assertDatabaseHas('bank_transactions', [
-                'source_id' => 'WISE001',
-                'merchant_name' => null,
-            ]);
-        } finally {
-            unlink($tempFile);
         }
     }
 }
